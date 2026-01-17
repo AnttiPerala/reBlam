@@ -1,13 +1,3 @@
-bl_info = {
-    'name': 'BLAM - Camera Calibration (Mesh Workflow v1.13)',
-    'author': 'Per Gantelius (Fixed for Blender 4.5+)',
-    'version': (0, 1, 13),
-    'blender': (4, 5, 0),
-    'location': '3D View > Sidebar > Photo Modeling Tools',
-    'description': 'Reconstruction of 3D geometry and estimation of camera orientation using Mesh Planes.',
-    'category': '3D View'
-}
-
 import bpy
 import mathutils
 import math
@@ -16,6 +6,16 @@ import operator
 import bmesh
 from bpy_extras.object_utils import world_to_camera_view
 from functools import reduce
+
+bl_info = {
+    'name': 'BLAM - Camera Calibration (Mesh Workflow v1.13)',
+    'author': 'Per Gantelius (Fixed for Blender 4.5+)',
+    'version': (0, 1, 14),
+    'blender': (4, 5, 0),
+    'location': '3D View > Sidebar > Photo Modeling Tools',
+    'description': 'Reconstruction of 3D geometry and estimation of camera orientation using Mesh Planes.',
+    'category': '3D View'
+}
 
 # =============================================================================
 # MATH LIBRARY
@@ -202,12 +202,10 @@ class BlamSolver:
              det = abs(a*d - b*c)
         
         if det < 1e-5:
-            # Parallel lines = Infinite VP
-            print("BLAM: Parallel Lines Detected (1-Point perspective)")
             inf_dist = 100000.0
             if fallback_dir:
                 return [fallback_dir[0] * inf_dist, fallback_dir[1] * inf_dist]
-            return [inf_dist, 0] # Absolute fallback
+            return [inf_dist, 0]
         
         try: return [f[0] for f in Mat(matrixRows).solve(Mat(rhsRows))]
         except: return [fallback_dir[0] * 100000.0, fallback_dir[1] * 100000.0]
@@ -223,9 +221,6 @@ class BlamSolver:
         FuPuv = length([x - y for x, y in zip(Fu, Puv)])
         
         fSq = FvPuv * FuPuv - PPuv * PPuv
-        
-        print(f"BLAM DEBUG: fSq={fSq}")
-        
         if fSq < 0: return None
         return math.sqrt(fSq)
     
@@ -309,9 +304,11 @@ class LoadImageAndSetupPlaneOperator(bpy.types.Operator):
         bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
         bpy.ops.object.mode_set(mode='EDIT')
         
+        # IMPROVEMENT: AUTO WIREFRAME
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':
                 area.spaces[0].region_3d.view_perspective = 'CAMERA'
+                area.spaces[0].shading.type = 'WIREFRAME' # Change to wireframe
         
         return {'FINISHED'}
     
@@ -322,17 +319,18 @@ class LoadImageAndSetupPlaneOperator(bpy.types.Operator):
 
 class SolveCameraFromMeshOperator(bpy.types.Operator):
     bl_idname = "object.solve_camera_from_mesh"
-    bl_label = "2. Reconstruct & Project"
+    bl_label = "2. Reconstruct & Align"
     
     def execute(self, context):
         obj = context.edit_object 
         cam = context.scene.camera
         if not obj or obj.type != 'MESH': return {'CANCELLED'}
         
-        # 1. Get Vertices & 2D Coords (RADIAL SORT)
         bm = bmesh.from_edit_mesh(obj.data)
         verts = [v for v in bm.verts]
-        if len(verts) != 4: return {'CANCELLED'}
+        if len(verts) != 4: 
+            self.report({'ERROR'}, "Mesh must have exactly 4 vertices")
+            return {'CANCELLED'}
         mw = obj.matrix_world
         
         vert_data = [] 
@@ -348,7 +346,6 @@ class SolveCameraFromMeshOperator(bpy.types.Operator):
 
         if context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
 
-        # 2. Determine Orientation
         dx_01 = abs(p2d[0].x - p2d[1].x)
         dy_01 = abs(p2d[0].y - p2d[1].y)
         is_horiz = dx_01 > dy_01
@@ -360,7 +357,6 @@ class SolveCameraFromMeshOperator(bpy.types.Operator):
             vp1_2d_a, vp1_2d_b = (p2d[1], p2d[2]), (p2d[0], p2d[3])
             vp2_2d_a, vp2_2d_b = (p2d[0], p2d[1]), (p2d[3], p2d[2])
         
-        # 3. Solver
         w, h = context.scene.render.resolution_x, context.scene.render.resolution_y
         def to_solver(pt): return [w/h * (pt.x - 0.5), (pt.y - 0.5)]
 
@@ -374,27 +370,28 @@ class SolveCameraFromMeshOperator(bpy.types.Operator):
         ])
         
         if vp1 is None or vp2 is None:
-            self.report({'ERROR'}, "Solve Failed: Geometry invalid."); return {'CANCELLED'}
+            self.report({'ERROR'}, "Solve Failed: Parallel lines detected."); return {'CANCELLED'}
         
-        ax1, ax2 = 0, 1 
+        # IMPROVEMENT: DYNAMIC AXIS ALIGNMENT FROM DROPDOWN
+        preset = context.scene.blam_axis_preset
+        if preset == 'XY': # Floor
+            ax1, ax2 = 0, 1 
+        elif preset == 'XZ': # Front Wall
+            ax1, ax2 = 0, 2
+        else: # YZ Side Wall
+            ax1, ax2 = 1, 2
+
         if vp2[0] < vp1[0]: vp1, vp2 = vp2, vp1; ax1, ax2 = ax2, ax1 
         
         f = BlamSolver.computeFocalLength(vp1, vp2, [0,0])
         used_default_fl = False
         
-        # INCREASED THRESHOLD:
-        # f=100.0 is massive. If it's valid math, we keep it.
-        # Only default if f is None (negative sqrt).
         if f is None or f > 100.0:
-            print(f"BLAM: Focal Length calculation invalid (f={f}). Defaulting.")
             current_lens = cam.data.lens
             sensor = cam.data.sensor_width
             f = current_lens / sensor
             used_default_fl = True
-        else:
-            print(f"BLAM: Focal Length Calculated: f={f}")
             
-        # 4. Apply Camera
         M = BlamSolver.computeCameraRotationMatrix(vp1, vp2, f, [0,0])
         if M is None:
              self.report({'ERROR'}, "Solve Failed: Rotation Matrix Error."); return {'CANCELLED'}
@@ -407,7 +404,7 @@ class SolveCameraFromMeshOperator(bpy.types.Operator):
         
         context.view_layer.update()
         
-        # 5. Reproject Vertices
+        # Reproject Vertices
         frame = cam.data.view_frame(scene=context.scene)
         frame_w = [cam.matrix_world @ v for v in frame]
         cam_pos = cam.matrix_world.translation
@@ -423,7 +420,7 @@ class SolveCameraFromMeshOperator(bpy.types.Operator):
              
         obj.data.update()
         
-        # 6. Reconstruct Geometry
+        # Trigger reconstruction and projection
         bpy.ops.object.select_all(action='DESELECT')
         obj.select_set(True)
         context.view_layer.objects.active = obj
@@ -432,7 +429,7 @@ class SolveCameraFromMeshOperator(bpy.types.Operator):
         bpy.ops.object.project_bg_onto_mesh()
         
         msg = f"Solved! FL: {round(cam.data.lens, 2)}mm"
-        if used_default_fl: msg += " (Defaulted - Check Console)"
+        if used_default_fl: msg += " (FL Estimation failed, kept current)"
         self.report({'INFO'}, msg)
         return {'FINISHED'}
 
@@ -450,11 +447,6 @@ class ProjectBackgroundImageOntoMeshOperator(bpy.types.Operator):
             for bg in camera.data.background_images:
                 if bg.source == 'IMAGE' and bg.image:
                     image_to_use = bg.image; break
-                elif bg.source == 'MOVIE_CLIP' and bg.clip:
-                    path = bpy.path.abspath(bg.clip.filepath)
-                    try: image_to_use = bpy.data.images.load(path, check_existing=True)
-                    except: pass
-                    break
         
         if not image_to_use: return {'CANCELLED'}
 
@@ -479,9 +471,10 @@ class ProjectBackgroundImageOntoMeshOperator(bpy.types.Operator):
         
         for m in mesh.modifiers:
             if m.type in ['UV_PROJECT', 'SUBSURF']: mesh.modifiers.remove(m)
-                
+        
+        # IMPROVEMENT: INCREASED SUBDIVISIONS FOR BETTER PROJECTION
         sub = mesh.modifiers.new(name="Subsurf", type='SUBSURF')
-        sub.subdivision_type = 'SIMPLE'; sub.levels = 4
+        sub.subdivision_type = 'SIMPLE'; sub.levels = 6 # Increased from 4 to 6
         
         proj_name = f"{mesh.name}_Projector"
         proj = bpy.data.objects.get(proj_name)
@@ -544,56 +537,41 @@ class Reconstruct3DMeshOperator(bpy.types.Operator):
         Qab, Qac, Qad = dot(qHatA, qHatB), dot(qHatA, qHatC), dot(qHatA, qHatD)
         Qba, Qbc, Qbd = dot(qHatB, qHatA), dot(qHatB, qHatC), dot(qHatB, qHatD)
         Qca, Qcb, Qcd = dot(qHatC, qHatA), dot(qHatC, qHatB), dot(qHatC, qHatD)
-        
         self.computeCi(Qab, Qac, Qad, Qbc, Qbd, Qcd)
         self.computeBi(Qab, Qac, Qad, Qbc, Qbd, Qcd)
-        
         if abs(self.B4) < 1e-6: self.B4 = 1e-6
-
         self.D3 = (self.C4 / self.B4) * self.B3 - self.C3
         self.D2 = (self.C4 / self.B4) * self.B2 - self.C2
         self.D1 = (self.C4 / self.B4) * self.B1 - self.C1
         self.D0 = (self.C4 / self.B4) * self.B0 - self.C0
-
         roots = solveCubic(self.D3, self.D2, self.D1, self.D0)
-        
         chosenRoot, minError = None, None
-        
         for root in roots:
             if type(root) == type(0j) or root <= 0: continue
-            
             lambdaD = root
             self.lambdaA = 1
             denLambdaA = (Qbd * lambdaD - Qab)
             if abs(denLambdaA) < 1e-6: denLambdaA = 1e-6
             self.lambdaB = (Qad * lambdaD - 1.0) / denLambdaA
-
             denLambdaC = (Qac - Qcd * lambdaD)
             if abs(denLambdaC) < 1e-6: denLambdaC = 1e-6
             self.lambdaC = (Qad * lambdaD - lambdaD * lambdaD) / denLambdaC
             self.lambdaD = lambdaD
-            
             pA, pB = [x * self.lambdaA for x in qHatA], [x * self.lambdaB for x in qHatB]
             pC, pD = [x * self.lambdaC for x in qHatC], [x * self.lambdaD for x in qHatD]
-            
             meanError, maxError = self.getQuadError(pA, pB, pC, pD)
             if minError == None or meanError < minError:
-                minError = meanError
-                chosenRoot = root
-        
+                minError = meanError; chosenRoot = root
         if chosenRoot == None: chosenRoot = 1.0
-        
         lambdaD = chosenRoot
         self.lambdaA = 1 
         denLambdaA = (Qbd * lambdaD - Qab)
         if abs(denLambdaA) < 1e-6: denLambdaA = 1e-6
         self.lambdaB = (Qad * lambdaD - 1.0) / denLambdaA
-        
         denLambdaC = (Qac - Qcd * lambdaD)
         if abs(denLambdaC) < 1e-6: denLambdaC = 1e-6
         self.lambdaC = (Qad * lambdaD - lambdaD * lambdaD) / denLambdaC
         self.lambdaD = lambdaD
-            
         pA, pB = [x * self.lambdaA for x in qHatA], [x * self.lambdaB for x in qHatB]
         pC, pD = [x * self.lambdaC for x in qHatC], [x * self.lambdaD for x in qHatD]
         return [pA, pB, pC, pD]
@@ -610,27 +588,21 @@ class Reconstruct3DMeshOperator(bpy.types.Operator):
                                    if len(f.vertices)==4 and len(set(f.vertices) & set(e.vertices)) == 2]
             if len(facesContainingEdge) == 2:
                 quadFacePairsBySharedEdge[e.index] = facesContainingEdge
-        
         numQuadFaces = len(computedCoordsByFace)
         matrixRows, rhRows = [], []
         face_to_idx = {f: i for i, f in enumerate(computedCoordsByFace.keys())}
-
         for eIdx, pair in quadFacePairsBySharedEdge.items():
             f0, f1 = pair
             f0Idx, f1Idx = face_to_idx[f0], face_to_idx[f1]
             c0, c1 = computedCoordsByFace[f0], computedCoordsByFace[f1]
             edge = inputMesh.data.edges[eIdx]
-            
             def get_depths(quad, v_idx):
                 for p in quad:
                     if p[-1] == v_idx: return p[2]
                 return 1.0
-            
             l00, l10 = get_depths(c0, edge.vertices[0]), get_depths(c1, edge.vertices[0])
             l01, l11 = get_depths(c0, edge.vertices[1]), get_depths(c1, edge.vertices[1])
-
             row_len = numQuadFaces - 1 if numQuadFaces > 1 else 1
-            
             for (la0, la1) in [(l00, l10), (l01, l11)]:
                 r, b = [0] * row_len, [0]
                 if f0Idx == 0:
@@ -642,9 +614,7 @@ class Reconstruct3DMeshOperator(bpy.types.Operator):
                 else:
                     r[f0Idx - 1] = la0
                     r[f1Idx - 1] = -la1
-                matrixRows.append(r)
-                rhRows.append(b)
-
+                matrixRows.append(r); rhRows.append(b)
         factors = [1.0]
         if numQuadFaces > 2 and len(matrixRows) > 0:
             m, b = Mat(matrixRows), Mat(rhRows)
@@ -654,49 +624,39 @@ class Reconstruct3DMeshOperator(bpy.types.Operator):
             if abs(matrixRows[0][0]) > 1e-6:
                 factors = [1, 0.5 * (rhRows[0][0]/matrixRows[0][0] + rhRows[1][0]/matrixRows[1][0])]
             else: factors = [1, 1]
-        
         final_quads = []
         for i, face in enumerate(computedCoordsByFace.keys()):
             quad = computedCoordsByFace[face]
             scale = factors[i] if i < len(factors) else 1.0
             final_quads.append([ [x * scale for x in q[:3]] for q in quad])
-        
         name = inputMesh.name + '_3D'
         me = bpy.data.meshes.new(name)    
         ob = bpy.data.objects.new(name, me)    
         bpy.context.collection.objects.link(ob)    
-        
         verts, faces, idx = [], [], 0
         for quad in final_quads:
             faces.append([idx, idx+1, idx+2, idx+3])
-            verts.extend(quad)
-            idx += 4
-        
+            verts.extend(quad); idx += 4
         me.from_pydata(verts, [], faces)    
         me.update(calc_edges=True)
-        
         bpy.ops.object.select_all(action='DESELECT')
         ob.select_set(True)
         bpy.context.view_layer.objects.active = ob
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.remove_doubles(threshold=0.001)
         bpy.ops.object.mode_set(mode='OBJECT')
-            
         return ob
     
     def getOutputMeshScale(self, camera, inMesh, outMesh):
         inMeanPos = [0.0] * 3
         cmi = camera.matrix_world.inverted()
         mm = inMesh.matrix_world
-        
         for v in inMesh.data.vertices:
             vCamSpace =  cmi @ mm @ v.co.to_4d()
             for i in range(3): inMeanPos[i] += vCamSpace[i] / len(inMesh.data.vertices)
-        
         outMeanPos = [0.0] * 3
         for v in outMesh.data.vertices:
             for i in range(3): outMeanPos[i] += v.co[i] / len(outMesh.data.vertices)
-
         inD = math.sqrt(sum([x*x for x in inMeanPos]))
         outD = math.sqrt(sum([x*x for x in outMeanPos]))
         return inD / outD if outD != 0 else 1
@@ -704,26 +664,20 @@ class Reconstruct3DMeshOperator(bpy.types.Operator):
     def execute(self, context):
         self.camera = bpy.context.scene.camera
         self.mesh = bpy.context.active_object
-        
         if not self.camera or not self.mesh or self.mesh.type != 'MESH':
-            self.report({'ERROR'}, "Req: Active Mesh and Camera")
-            return {'CANCELLED'}
-        
+            self.report({'ERROR'}, "Req: Active Mesh and Camera"); return {'CANCELLED'}
         computedCoordsByFace, quads = {}, []
         for f in self.mesh.data.polygons:
             if len(f.vertices) == 4:
                 inputPointsCam = self.worldToCameraSpace([self.mesh.data.vertices[i] for i in f.vertices])
                 qHats = [normalize(x) for x in inputPointsCam]
                 outputPointsCam = self.computeQuadDepthInformation(*qHats)
-                
                 for i in range(4): outputPointsCam[i] = list(outputPointsCam[i]) + [f.vertices[i]]
                 computedCoordsByFace[f] = outputPointsCam
                 quads.append(outputPointsCam)
-              
         m = self.createMesh(self.mesh, computedCoordsByFace, quads)
         m.matrix_world = self.camera.matrix_world
         m.scale = [self.getOutputMeshScale(self.camera, self.mesh, m)] * 3
-        
         return{'FINISHED'}
 
 class ApplyProjectedTexturesOperator(bpy.types.Operator):
@@ -736,15 +690,11 @@ class ApplyProjectedTexturesOperator(bpy.types.Operator):
         if not obj or obj.type != 'MESH':
             self.report({'ERROR'}, "Select a mesh")
             return {'CANCELLED'}
-
         if context.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
-
         subsurf_mods = [m.name for m in obj.modifiers if m.type == 'SUBSURF']
         uv_mods = [m.name for m in obj.modifiers if m.type == 'UV_PROJECT']
-
         for name in subsurf_mods: bpy.ops.object.modifier_apply(modifier=name)
         for name in uv_mods: bpy.ops.object.modifier_apply(modifier=name)
-
         self.report({'INFO'}, "Textures Applied!")
         return {'FINISHED'}
 
@@ -757,10 +707,15 @@ class PhotoModelingToolsPanel(bpy.types.Panel):
 
     def draw(self, context):
         l = self.layout
+        scn = context.scene
         
         l.operator("object.load_image_setup_plane", icon='FILE_IMAGE')
         
-        row = l.row()
+        box = l.box()
+        box.label(text="Alignment Axis:")
+        box.prop(scn, "blam_axis_preset", text="")
+        
+        row = box.row()
         row.enabled = bool(context.mode == 'EDIT_MESH' or (context.active_object and context.active_object.type == 'MESH'))
         row.operator("object.solve_camera_from_mesh", icon='OUTLINER_OB_CAMERA')
         
@@ -777,9 +732,22 @@ classes = (
 
 def register():
     for cls in classes: bpy.utils.register_class(cls)
+    
+    # IMPROVEMENT: PROPERTY FOR AXIS DROPDOWN
+    bpy.types.Scene.blam_axis_preset = bpy.props.EnumProperty(
+        name="Axis Preset",
+        description="Choose what world axis the active face represents",
+        items=[
+            ('XY', "Floor (XY)", "Align face to the world ground plane"),
+            ('XZ', "Front Wall (XZ)", "Align face to the front wall plane"),
+            ('YZ', "Side Wall (YZ)", "Align face to the side wall plane"),
+        ],
+        default='XY'
+    )
  
 def unregister():
     for cls in classes: bpy.utils.unregister_class(cls)
+    del bpy.types.Scene.blam_axis_preset
  
 if __name__ == "__main__":
     register()
