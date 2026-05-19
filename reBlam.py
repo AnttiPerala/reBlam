@@ -4,8 +4,14 @@ import math
 import cmath
 import operator
 import bmesh
+import gpu
 from bpy_extras.object_utils import world_to_camera_view
+from bpy_extras import view3d_utils
+from gpu_extras.batch import batch_for_shader
 from functools import reduce
+
+_grid_draw_handle = None
+_grid_timer_running = False
 
 bl_info = {
     'name': 'BLAM - Camera Calibration (Mesh Workflow v1.13)',
@@ -170,45 +176,233 @@ def normalize(vec):
 def length(vec): return math.sqrt(sum([x * x for x in vec]))
 def dot(x, y): return sum([x[i] * y[i] for i in range(len(x))])
 
+def lerp2(a, b, t):
+    return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+
+def ordered_points_2d(points):
+    cx = sum(p[0] for p in points) / len(points)
+    cy = sum(p[1] for p in points) / len(points)
+    ordered = sorted(points, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+    start = max(range(len(ordered)), key=lambda i: ordered[i][0] + ordered[i][1])
+    return ordered[start:] + ordered[:start]
+
+def extend_line_to_region(p1, p2, width, height):
+    x1, y1 = p1
+    x2, y2 = p2
+    dx, dy = x2 - x1, y2 - y1
+    hits = []
+    if abs(dx) > 1e-8:
+        for x in (0.0, float(width)):
+            t = (x - x1) / dx
+            y = y1 + t * dy
+            if -1.0 <= y <= height + 1.0:
+                hits.append((x, y))
+    if abs(dy) > 1e-8:
+        for y in (0.0, float(height)):
+            t = (y - y1) / dy
+            x = x1 + t * dx
+            if -1.0 <= x <= width + 1.0:
+                hits.append((x, y))
+    unique = []
+    for hit in hits:
+        if not any(length([hit[0] - old[0], hit[1] - old[1]]) < 1.0 for old in unique):
+            unique.append(hit)
+    if len(unique) >= 2:
+        return unique[0], unique[1]
+    return p1, p2
+
+def solve_unit_square_homography(points):
+    src = [(1, 1), (0, 1), (0, 0), (1, 0)]
+    rows, rhs = [], []
+    for (x, y), (u, v) in zip(src, points):
+        rows.append([x, y, 1, 0, 0, 0, -u * x, -u * y])
+        rhs.append([u])
+        rows.append([0, 0, 0, x, y, 1, -v * x, -v * y])
+        rhs.append([v])
+    try:
+        values = [item[0] for item in Mat(rows).solve(Mat(rhs))]
+    except:
+        return None
+    return values + [1.0]
+
+def apply_homography(h, x, y):
+    den = h[6] * x + h[7] * y + h[8]
+    if abs(den) < 1e-8:
+        return None
+    return ((h[0] * x + h[1] * y + h[2]) / den, (h[3] * x + h[4] * y + h[5]) / den)
+
+def homography_polyline_segments(h, constant_axis, value, start=-0.45, end=1.45, samples=40):
+    points = []
+    for i in range(samples + 1):
+        t = start + (end - start) * (i / samples)
+        point = apply_homography(h, value, t) if constant_axis == 'x' else apply_homography(h, t, value)
+        if point is not None and all(math.isfinite(v) for v in point):
+            points.append(point)
+        elif len(points) > 1:
+            break
+    return list(zip(points, points[1:]))
+
+def draw_2d_lines(lines, color, width=1.0):
+    if not lines:
+        return
+    coords = []
+    for a, b in lines:
+        coords.extend([a, b])
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    batch = batch_for_shader(shader, 'LINES', {"pos": coords})
+    gpu.state.blend_set('ALPHA')
+    gpu.state.line_width_set(width)
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+    gpu.state.line_width_set(1.0)
+    gpu.state.blend_set('NONE')
+
+def get_active_quad_screen_points(context, region, region_data):
+    obj = context.edit_object if context.mode == 'EDIT_MESH' else context.active_object
+    if not obj or obj.type != 'MESH':
+        return []
+    if context.mode == 'EDIT_MESH':
+        bm = bmesh.from_edit_mesh(obj.data)
+        verts = [v for v in bm.verts if v.select] or list(bm.verts)
+        if len(verts) != 4:
+            return []
+        world_points = [obj.matrix_world @ v.co for v in verts]
+    else:
+        verts = list(obj.data.vertices)
+        if len(verts) != 4:
+            return []
+        world_points = [obj.matrix_world @ v.co for v in verts]
+    screen_points = []
+    for point in world_points:
+        co = view3d_utils.location_3d_to_region_2d(region, region_data, point)
+        if co is None:
+            return []
+        screen_points.append((co.x, co.y))
+    return ordered_points_2d(screen_points)
+
+def draw_perspective_grid_callback():
+    context = bpy.context
+    scene = context.scene
+    if not getattr(scene, "blam_show_perspective_grid", False):
+        return
+    area = context.area
+    region = context.region
+    space = context.space_data
+    if not area or area.type != 'VIEW_3D' or not region or not space or not space.region_3d:
+        return
+    points = get_active_quad_screen_points(context, region, space.region_3d)
+    if len(points) != 4:
+        return
+
+    p0, p1, p2, p3 = points
+    grid_lines, edge_lines = [], [(p0, p1), (p1, p2), (p2, p3), (p3, p0)]
+
+    h = solve_unit_square_homography(points)
+    divisions = max(2, int(getattr(scene, "blam_grid_divisions", 8)))
+    if h:
+        for i in range(-divisions // 2, divisions + divisions // 2 + 1):
+            t = i / divisions
+            grid_lines.extend(homography_polyline_segments(h, 'x', t))
+            grid_lines.extend(homography_polyline_segments(h, 'y', t))
+    else:
+        width, height = region.width, region.height
+        for i in range(1, divisions):
+            t = i / divisions
+            top = lerp2(p1, p0, t)
+            bottom = lerp2(p2, p3, t)
+            left = lerp2(p1, p2, t)
+            right = lerp2(p0, p3, t)
+            grid_lines.append(extend_line_to_region(top, bottom, width, height))
+            grid_lines.append(extend_line_to_region(left, right, width, height))
+
+    draw_2d_lines(grid_lines, (0.35, 0.75, 1.0, 0.18), 1.0)
+    draw_2d_lines(edge_lines, (0.35, 0.75, 1.0, 0.45), 1.4)
+
+def tag_view3d_redraw():
+    global _grid_timer_running
+    if _grid_draw_handle is None and not getattr(bpy.context.scene, "blam_show_perspective_grid", False):
+        _grid_timer_running = False
+        return None
+    wm = bpy.context.window_manager
+    if not wm:
+        return None
+    for window in wm.windows:
+        screen = window.screen
+        if not screen:
+            continue
+        for area in screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+    return 0.05 if getattr(bpy.context.scene, "blam_show_perspective_grid", False) else 0.25
+
+def ensure_grid_draw_handler():
+    global _grid_draw_handle, _grid_timer_running
+    if _grid_draw_handle is None:
+        _grid_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            draw_perspective_grid_callback, (), 'WINDOW', 'POST_PIXEL'
+        )
+    if not _grid_timer_running:
+        bpy.app.timers.register(tag_view3d_redraw, persistent=True)
+        _grid_timer_running = True
+
+def remove_grid_draw_handler():
+    global _grid_draw_handle, _grid_timer_running
+    if _grid_draw_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_grid_draw_handle, 'WINDOW')
+        _grid_draw_handle = None
+    _grid_timer_running = False
+
+def update_grid_visibility(scene, context):
+    if scene.blam_show_perspective_grid:
+        ensure_grid_draw_handler()
+    if context.screen:
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
 # =============================================================================
 # BLAM SOLVER CORE
 # =============================================================================
 
 class BlamSolver:
     @staticmethod
-    def computeIntersectionPointForLineSegments(lineSet):
-        matrixRows, rhsRows = [], []
-        fallback_dir = None
-        
+    def computeVanishingPointForLineSegments(lineSet):
+        rows, rhs, dirs = [], [], []
         for line in lineSet:
-            p = line[0]        
+            p = line[0]
             d = [x - y for x, y in zip(line[1], line[0])]
             l = math.sqrt(d[0]**2 + d[1]**2)
-            if l == 0: continue
-            
+            if l < 1e-8:
+                continue
             d_norm = [d[0]/l, d[1]/l]
-            if fallback_dir is None: fallback_dir = d_norm
-            
+            dirs.append(d_norm)
             n = [d_norm[1], -d_norm[0]]
-            matrixRows.append(n)
-            rhsRows.append([p[0] * n[0] + p[1] * n[1]])
-        
-        if len(matrixRows) < 2: return None
-        
-        det = 0
-        if len(matrixRows) == 2 and len(matrixRows[0]) == 2:
-             a, b = matrixRows[0][0], matrixRows[0][1]
-             c, d = matrixRows[1][0], matrixRows[1][1]
-             det = abs(a*d - b*c)
-        
-        if det < 1e-5:
-            inf_dist = 100000.0
-            if fallback_dir:
-                return [fallback_dir[0] * inf_dist, fallback_dir[1] * inf_dist]
-            return [inf_dist, 0]
-        
-        try: return [f[0] for f in Mat(matrixRows).solve(Mat(rhsRows))]
-        except: return [fallback_dir[0] * 100000.0, fallback_dir[1] * 100000.0]
+            rows.append(n)
+            rhs.append([p[0] * n[0] + p[1] * n[1]])
+
+        if len(rows) < 2:
+            return None, 0.0, False
+
+        a, b = rows[0][0], rows[0][1]
+        c, d = rows[1][0], rows[1][1]
+        quality = abs(a*d - b*c)
+        if quality < 1e-4:
+            avg = normalize([sum(d[0] for d in dirs), sum(d[1] for d in dirs)])
+            if length(avg) == 0:
+                avg = dirs[0]
+            dist = max(1000.0, 500.0 / max(quality, 1e-6))
+            return [avg[0] * dist, avg[1] * dist], quality, True
+
+        try:
+            return [f[0] for f in Mat(rows).solve(Mat(rhs))], quality, False
+        except:
+            return None, 0.0, False
+
+    @staticmethod
+    def computeIntersectionPointForLineSegments(lineSet):
+        vp, quality, is_parallel = BlamSolver.computeVanishingPointForLineSegments(lineSet)
+        return vp
 
     @staticmethod
     def computeFocalLength(Fu, Fv, P):
@@ -303,6 +497,8 @@ class LoadImageAndSetupPlaneOperator(bpy.types.Operator):
             
         bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
         bpy.ops.object.mode_set(mode='EDIT')
+        scn.blam_show_perspective_grid = True
+        ensure_grid_draw_handler()
         
         # IMPROVEMENT: AUTO WIREFRAME
         for area in context.screen.areas:
@@ -360,14 +556,16 @@ class SolveCameraFromMeshOperator(bpy.types.Operator):
         w, h = context.scene.render.resolution_x, context.scene.render.resolution_y
         def to_solver(pt): return [w/h * (pt.x - 0.5), (pt.y - 0.5)]
 
-        vp1 = BlamSolver.computeIntersectionPointForLineSegments([
+        vp1_lines = [
             [to_solver(vp1_2d_a[0]), to_solver(vp1_2d_a[1])],
             [to_solver(vp1_2d_b[0]), to_solver(vp1_2d_b[1])]
-        ])
-        vp2 = BlamSolver.computeIntersectionPointForLineSegments([
+        ]
+        vp2_lines = [
             [to_solver(vp2_2d_a[0]), to_solver(vp2_2d_a[1])],
             [to_solver(vp2_2d_b[0]), to_solver(vp2_2d_b[1])]
-        ])
+        ]
+        vp1, vp1_quality, vp1_parallel = BlamSolver.computeVanishingPointForLineSegments(vp1_lines)
+        vp2, vp2_quality, vp2_parallel = BlamSolver.computeVanishingPointForLineSegments(vp2_lines)
         
         if vp1 is None or vp2 is None:
             self.report({'ERROR'}, "Solve Failed: Parallel lines detected."); return {'CANCELLED'}
@@ -385,8 +583,13 @@ class SolveCameraFromMeshOperator(bpy.types.Operator):
         
         f = BlamSolver.computeFocalLength(vp1, vp2, [0,0])
         used_default_fl = False
+        solve_notes = []
         
-        if f is None or f > 100.0:
+        if vp1_parallel or vp2_parallel:
+            solve_notes.append("one edge family is nearly parallel")
+        if min(vp1_quality, vp2_quality) < 1e-3:
+            solve_notes.append("low vanishing point confidence")
+        if f is None or f > 100.0 or vp1_parallel or vp2_parallel:
             current_lens = cam.data.lens
             sensor = cam.data.sensor_width
             f = current_lens / sensor
@@ -429,7 +632,11 @@ class SolveCameraFromMeshOperator(bpy.types.Operator):
         bpy.ops.object.project_bg_onto_mesh()
         
         msg = f"Solved! FL: {round(cam.data.lens, 2)}mm"
-        if used_default_fl: msg += " (FL Estimation failed, kept current)"
+        if used_default_fl:
+            msg += " (kept current FL"
+            if solve_notes:
+                msg += ": " + ", ".join(solve_notes)
+            msg += ")"
         self.report({'INFO'}, msg)
         return {'FINISHED'}
 
@@ -714,6 +921,9 @@ class PhotoModelingToolsPanel(bpy.types.Panel):
         box = l.box()
         box.label(text="Alignment Axis:")
         box.prop(scn, "blam_axis_preset", text="")
+        box.prop(scn, "blam_show_perspective_grid", text="Live Perspective Grid")
+        if scn.blam_show_perspective_grid:
+            box.prop(scn, "blam_grid_divisions", text="Grid Density")
         
         row = box.row()
         row.enabled = bool(context.mode == 'EDIT_MESH' or (context.active_object and context.active_object.type == 'MESH'))
@@ -744,9 +954,26 @@ def register():
         ],
         default='XY'
     )
+    bpy.types.Scene.blam_show_perspective_grid = bpy.props.BoolProperty(
+        name="Live Perspective Grid",
+        description="Draw a faint projected grid from the current quad while editing",
+        default=False,
+        update=update_grid_visibility
+    )
+    bpy.types.Scene.blam_grid_divisions = bpy.props.IntProperty(
+        name="Grid Density",
+        description="Number of subdivisions to draw in each perspective direction",
+        default=8,
+        min=2,
+        max=32
+    )
+    ensure_grid_draw_handler()
  
 def unregister():
+    remove_grid_draw_handler()
     for cls in classes: bpy.utils.unregister_class(cls)
+    del bpy.types.Scene.blam_grid_divisions
+    del bpy.types.Scene.blam_show_perspective_grid
     del bpy.types.Scene.blam_axis_preset
  
 if __name__ == "__main__":
