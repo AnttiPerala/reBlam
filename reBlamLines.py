@@ -727,17 +727,33 @@ def add_live_projection_modifier(scene, cam, obj, image, uv_name):
     return modifier
 
 
-def apply_live_projection_modifier(context, obj):
-    modifier = obj.modifiers.get("reBlam Live Camera Projection")
+def add_live_subdivision_modifier(scene, obj):
+    levels = getattr(scene, "reblam_lines_live_subdivision_levels", 2)
+    if levels <= 0:
+        return None
+    old_modifier = obj.modifiers.get("reBlam Live Simple Subdivision")
+    if old_modifier:
+        obj.modifiers.remove(old_modifier)
+    modifier = obj.modifiers.new("reBlam Live Simple Subdivision", 'SUBSURF')
+    modifier.subdivision_type = 'SIMPLE'
+    modifier.levels = levels
+    modifier.render_levels = levels
+    if hasattr(modifier, "show_in_editmode"):
+        modifier.show_in_editmode = True
+    return modifier
+
+
+def apply_modifier_by_name(context, obj, modifier_name):
+    modifier = obj.modifiers.get(modifier_name)
     if not modifier:
         return False
     active = context.view_layer.objects.active
-    was_selected = obj.select_get()
+    selected = list(context.selected_objects)
     mode = obj.mode
     try:
         if mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
-        for item in context.selected_objects:
+        for item in selected:
             item.select_set(False)
         obj.select_set(True)
         context.view_layer.objects.active = obj
@@ -746,13 +762,22 @@ def apply_live_projection_modifier(context, obj):
     except Exception:
         return False
     finally:
-        obj.select_set(was_selected)
+        for item in context.selected_objects:
+            item.select_set(False)
+        for item in selected:
+            item.select_set(True)
         context.view_layer.objects.active = active
         if mode != 'OBJECT' and context.view_layer.objects.active:
             try:
                 bpy.ops.object.mode_set(mode=mode)
             except Exception:
                 pass
+
+
+def apply_live_projection_stack(context, obj):
+    applied_subdivision = apply_modifier_by_name(context, obj, "reBlam Live Simple Subdivision")
+    applied_projection = apply_modifier_by_name(context, obj, "reBlam Live Camera Projection")
+    return applied_subdivision or applied_projection
 
 
 def assign_camera_projected_uvs(scene, cam, obj, uv_name="reBlam_CameraProjection"):
@@ -1135,6 +1160,7 @@ class REBLAMLINES_OT_create_projected_plane(bpy.types.Operator):
 
         uv_name = "reBlam_CameraProjection"
         apply_photo_material(obj, image, uv_name)
+        add_live_subdivision_modifier(scene, obj)
         if not add_live_projection_modifier(scene, cam, obj, image, uv_name):
             self.report({'ERROR'}, "Could not add live camera projection.")
             return {'CANCELLED'}
@@ -1165,7 +1191,7 @@ class REBLAMLINES_OT_finalize_texture(bpy.types.Operator):
             return {'CANCELLED'}
 
         uv_name = "reBlam_CameraProjection"
-        applied_live = apply_live_projection_modifier(context, obj)
+        applied_live = apply_live_projection_stack(context, obj)
         if not applied_live and not assign_camera_projected_uvs(scene, cam, obj, uv_name):
             self.report({'ERROR'}, "Could not write projected UVs.")
             return {'CANCELLED'}
@@ -1256,6 +1282,7 @@ class REBLAMLINES_PT_panel(bpy.types.Panel):
         box.prop(scene, "reblam_lines_plane_offset", text="Plane Height")
         box.prop(scene, "reblam_lines_plane_extent", text="Plane Extent")
         box.prop(scene, "reblam_lines_plane_subdivisions", text="Plane Detail")
+        box.prop(scene, "reblam_lines_live_subdivision_levels", text="Live Subdivision")
         box.prop(scene, "reblam_lines_inlier_threshold", text="Line Tolerance")
         box.prop(scene, "reblam_lines_max_families", text="Max Families")
         box.prop(scene, "reblam_lines_use_principal_solve", text="3-Axis Optical Center")
@@ -1329,6 +1356,13 @@ def register():
         min=0.25,
         max=3.0,
         precision=2
+    )
+    bpy.types.Scene.reblam_lines_live_subdivision_levels = bpy.props.IntProperty(
+        name="Live Subdivision",
+        description="Simple subdivision levels added before live camera projection, so extruded faces receive denser projected texture",
+        default=2,
+        min=0,
+        max=5
     )
     bpy.types.Scene.reblam_lines_plane_offset = bpy.props.FloatProperty(
         name="Plane Height",
@@ -1426,6 +1460,7 @@ def unregister():
     del bpy.types.Scene.reblam_lines_max_families
     del bpy.types.Scene.reblam_lines_inlier_threshold
     del bpy.types.Scene.reblam_lines_plane_offset
+    del bpy.types.Scene.reblam_lines_live_subdivision_levels
     del bpy.types.Scene.reblam_lines_plane_extent
     del bpy.types.Scene.reblam_lines_plane_subdivisions
     del bpy.types.Scene.reblam_lines_axis_preset
