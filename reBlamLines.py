@@ -207,6 +207,10 @@ def line_color(line):
     return UNCLASSIFIED_COLOR
 
 
+def has_loaded_reblam_image(cam):
+    return bool(cam and camera_background_image(cam))
+
+
 def visible_plane_bounds(scene, cam):
     axis_a, axis_b = axis_names_from_preset(scene)
     ax_a = axis_index(axis_a)
@@ -249,7 +253,7 @@ def visible_plane_bounds(scene, cam):
 
 
 def draw_plane_grid(scene, cam, region, region_data):
-    if not getattr(scene, "reblam_lines_show_plane_grid", True):
+    if not has_loaded_reblam_image(cam) or not getattr(scene, "reblam_lines_show_plane_grid", True):
         return
     axis_a, axis_b, ax_a, ax_b, normal_index, plane_value, min_a, max_a, min_b, max_b, _has_hits = visible_plane_bounds(scene, cam)
     divisions = 16
@@ -286,7 +290,7 @@ def draw_guides_callback():
     context = bpy.context
     scene = context.scene
     cam = scene.camera
-    if not cam or not getattr(scene, "reblam_lines_show_guides", True):
+    if not has_loaded_reblam_image(cam) or not getattr(scene, "reblam_lines_show_guides", True):
         return
     area = context.area
     region = context.region
@@ -1231,6 +1235,7 @@ class REBLAMLINES_GGT_plane_height(bpy.types.GizmoGroup):
         return (
             scene
             and scene.camera
+            and has_loaded_reblam_image(scene.camera)
             and hasattr(scene, "reblam_lines_plane_offset")
             and getattr(scene, "reblam_lines_show_plane_grid", False)
         )
