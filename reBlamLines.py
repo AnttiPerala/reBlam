@@ -217,55 +217,42 @@ def visible_plane_bounds(scene, cam):
     ax_b = axis_index(axis_b)
     normal_index = plane_normal_axis(axis_a, axis_b)
     plane_value = getattr(scene, "reblam_lines_plane_offset", 0.0)
-
-    hits = []
-    samples = 12
-    for y in range(samples + 1):
-        v = y / samples
-        for x in range(samples + 1):
-            u = x / samples
-            if x not in {0, samples} and y not in {0, samples}:
-                continue
-            hit = camera_uv_ray_plane_intersection(scene, cam, u, v, normal_index, plane_value)
-            if hit:
-                hits.append(hit)
-
-    if len(hits) >= 2:
-        min_a = min(point[ax_a] for point in hits)
-        max_a = max(point[ax_a] for point in hits)
-        min_b = min(point[ax_b] for point in hits)
-        max_b = max(point[ax_b] for point in hits)
-    else:
-        span = max(scene.reblam_lines_camera_distance, 1.0)
-        min_a, max_a = -span, span
-        min_b, max_b = -span, span
-
+    center = plane_widget_center(scene, cam)
     extent = max(getattr(scene, "reblam_lines_plane_extent", 1.0), 0.05)
-    span_a = max(max_a - min_a, 1.0)
-    span_b = max(max_b - min_b, 1.0)
-    pad_a = span_a * max(extent - 1.0, 0.0) * 0.5
-    pad_b = span_b * max(extent - 1.0, 0.0) * 0.5
-    min_a -= pad_a
-    max_a += pad_a
-    min_b -= pad_b
-    max_b += pad_b
-    return axis_a, axis_b, ax_a, ax_b, normal_index, plane_value, min_a, max_a, min_b, max_b, bool(hits)
+    extent_a = max(getattr(scene, "reblam_lines_plane_extent_a", 1.0), 0.05)
+    extent_b = max(getattr(scene, "reblam_lines_plane_extent_b", 1.0), 0.05)
+    aspect = scene.render.resolution_x / max(scene.render.resolution_y, 1)
+    base_span = max(scene.reblam_lines_camera_distance, 1.0) * extent
+    span_a = max(base_span * max(aspect, 1.0) * extent_a, 1.0)
+    span_b = max(base_span * max(1.0 / max(aspect, 1e-8), 1.0) * extent_b, 1.0)
+    normal = mathutils.Vector((0.0, 0.0, 0.0))
+    normal[normal_index] = 1.0
+    basis_a = mathutils.Vector((0.0, 0.0, 0.0))
+    basis_b = mathutils.Vector((0.0, 0.0, 0.0))
+    basis_a[ax_a] = 1.0
+    basis_b[ax_b] = 1.0
+    rotation = mathutils.Matrix.Rotation(getattr(scene, "reblam_lines_grid_rotation", 0.0), 4, normal)
+    basis_a = (rotation @ basis_a).normalized()
+    basis_b = (rotation @ basis_b).normalized()
+    min_a = -span_a * 0.5
+    max_a = span_a * 0.5
+    min_b = -span_b * 0.5
+    max_b = span_b * 0.5
+    return axis_a, axis_b, normal_index, plane_value, center, basis_a, basis_b, min_a, max_a, min_b, max_b, True
 
 
 def draw_plane_grid(scene, cam, region, region_data):
     if not has_loaded_reblam_image(cam) or not getattr(scene, "reblam_lines_show_plane_grid", True):
         return
-    axis_a, axis_b, ax_a, ax_b, normal_index, plane_value, min_a, max_a, min_b, max_b, _has_hits = visible_plane_bounds(scene, cam)
-    divisions = 16
-    segments_a = []
-    segments_b = []
+    axis_a, axis_b, normal_index, plane_value, center, basis_a, basis_b, min_a, max_a, min_b, max_b, _has_hits = visible_plane_bounds(scene, cam)
+    divisions = max(1, min(getattr(scene, "reblam_lines_plane_subdivisions", 48), 120))
+    axis_b_segments = []
+    axis_a_segments = []
 
     def plane_point(value_a, value_b):
-        coords = [0.0, 0.0, 0.0]
-        coords[ax_a] = value_a
-        coords[ax_b] = value_b
-        coords[normal_index] = plane_value
-        return mathutils.Vector(coords)
+        point = center + basis_a * value_a + basis_b * value_b
+        point[normal_index] = plane_value
+        return point
 
     for index in range(divisions + 1):
         t = index / divisions
@@ -274,16 +261,16 @@ def draw_plane_grid(scene, cam, region, region_data):
         p1 = world_to_region(region, region_data, plane_point(value_a, min_b))
         p2 = world_to_region(region, region_data, plane_point(value_a, max_b))
         if p1 and p2:
-            segments_a.append((p1, p2))
+            axis_b_segments.append((p1, p2))
         p3 = world_to_region(region, region_data, plane_point(min_a, value_b))
         p4 = world_to_region(region, region_data, plane_point(max_a, value_b))
         if p3 and p4:
-            segments_b.append((p3, p4))
+            axis_a_segments.append((p3, p4))
 
     alpha = getattr(scene, "reblam_lines_grid_opacity", 0.45)
     width = getattr(scene, "reblam_lines_grid_width", 2.0)
-    draw_line_segments(segments_a, (AXIS_COLORS[axis_a][0], AXIS_COLORS[axis_a][1], AXIS_COLORS[axis_a][2], alpha), width)
-    draw_line_segments(segments_b, (AXIS_COLORS[axis_b][0], AXIS_COLORS[axis_b][1], AXIS_COLORS[axis_b][2], alpha), width)
+    draw_line_segments(axis_a_segments, (AXIS_COLORS[axis_a][0], AXIS_COLORS[axis_a][1], AXIS_COLORS[axis_a][2], alpha), width)
+    draw_line_segments(axis_b_segments, (AXIS_COLORS[axis_b][0], AXIS_COLORS[axis_b][1], AXIS_COLORS[axis_b][2], alpha), width)
 
 
 def draw_guides_callback():
@@ -477,6 +464,31 @@ def focal_mm_from_unit(f_unit, cam, scene):
     aspect = scene.render.resolution_x / max(scene.render.resolution_y, 1)
     sensor_extent = cam.data.sensor_width if aspect > 1 else cam.data.sensor_width / max(aspect, 1e-8)
     return 0.5 * f_unit * sensor_extent
+
+
+def focal_unit_from_mm(lens_mm, cam, scene):
+    aspect = scene.render.resolution_x / max(scene.render.resolution_y, 1)
+    sensor_extent = cam.data.sensor_width if aspect > 1 else cam.data.sensor_width / max(aspect, 1e-8)
+    return 2.0 * lens_mm / max(sensor_extent, 1e-8)
+
+
+def update_reblam_focal_length(self, context):
+    scene = context.scene
+    cam = scene.camera if scene else None
+    if cam:
+        cam.data.lens = scene.reblam_lines_focal_length
+
+
+def update_live_subdivision_levels(self, context):
+    scene = context.scene
+    if not scene:
+        return
+    levels = scene.reblam_lines_live_subdivision_levels
+    for obj in scene.objects:
+        modifier = obj.modifiers.get("reBlam Live Simple Subdivision")
+        if modifier:
+            modifier.levels = levels
+            modifier.render_levels = levels
 
 
 def compute_focal_from_vps(vp1, vp2, principal=(0.0, 0.0)):
@@ -801,30 +813,17 @@ def assign_camera_projected_uvs(scene, cam, obj, uv_name="reBlam_CameraProjectio
 def create_projected_plane_mesh(context):
     scene = context.scene
     cam = scene.camera
-    subdivisions = max(1, scene.reblam_lines_plane_subdivisions)
-    axis_a, axis_b, ax_a, ax_b, normal_index, plane_value, min_a, max_a, min_b, max_b, has_hits = visible_plane_bounds(scene, cam)
+    axis_a, axis_b, normal_index, plane_value, center, basis_a, basis_b, min_a, max_a, min_b, max_b, has_hits = visible_plane_bounds(scene, cam)
     if not has_hits:
         return None, "The current preview plane is not visible in front of the camera. Move Plane Height or choose another plane orientation."
 
     vertices = []
-    for y in range(subdivisions + 1):
-        t = y / subdivisions
-        value_b = min_b + (max_b - min_b) * t
-        for x in range(subdivisions + 1):
-            s = x / subdivisions
-            value_a = min_a + (max_a - min_a) * s
-            coords = [0.0, 0.0, 0.0]
-            coords[ax_a] = value_a
-            coords[ax_b] = value_b
-            coords[normal_index] = plane_value
-            vertices.append(tuple(coords))
+    for value_a, value_b in ((min_a, min_b), (max_a, min_b), (max_a, max_b), (min_a, max_b)):
+        point = center + basis_a * value_a + basis_b * value_b
+        point[normal_index] = plane_value
+        vertices.append(tuple(point))
 
-    faces = []
-    stride = subdivisions + 1
-    for y in range(subdivisions):
-        for x in range(subdivisions):
-            i = y * stride + x
-            faces.append((i, i + 1, i + stride + 1, i + stride))
+    faces = [(0, 1, 2, 3)]
 
     mesh = bpy.data.meshes.new(f"reBlam_{scene.reblam_lines_axis_preset}_Projected_Mesh")
     mesh.from_pydata(vertices, [], faces)
@@ -878,6 +877,23 @@ def nearest_guide_line(scene, cam, region, region_data, mouse_xy):
             best_index = index
             best_dist = dist
     return best_index
+
+
+def set_default_line_geometry(guide, axis, index):
+    offset = ((index % 7) - 3) * 0.04
+    if axis == 'Z':
+        x = clamp(0.5 + offset, 0.12, 0.88)
+        guide.x1, guide.y1 = x, 0.25
+        guide.x2, guide.y2 = x, 0.75
+    elif axis == 'Y':
+        y = clamp(0.5 + offset, 0.12, 0.88)
+        guide.x1, guide.y1 = 0.25, y
+        guide.x2, guide.y2 = 0.75, y
+    else:
+        guide.x1 = clamp(0.35 + offset, 0.12, 0.88)
+        guide.y1 = 0.65
+        guide.x2 = clamp(0.65 + offset, 0.12, 0.88)
+        guide.y2 = 0.35
 
 
 class REBLAMLinesGuide(bpy.types.PropertyGroup):
@@ -959,15 +975,11 @@ class REBLAMLINES_OT_add_line(bpy.types.Operator):
         index = len(scene.reblam_lines)
         guide = scene.reblam_lines.add()
         guide.name = f"Line {index + 1}"
-        offset = ((index % 7) - 3) * 0.055
-        guide.x1 = 0.22
-        guide.y1 = clamp(0.5 + offset)
-        guide.x2 = 0.78
-        guide.y2 = clamp(0.5 + offset)
         if index > 0:
             guide.axis = scene.reblam_lines[index - 1].axis
         else:
             guide.axis = 'X'
+        set_default_line_geometry(guide, guide.axis, index)
         guide.family = -1
         scene.reblam_lines_active_index = index
         ensure_draw_handler()
@@ -1073,6 +1085,8 @@ class REBLAMLINES_OT_analyze_solve(bpy.types.Operator):
         if len(scene.reblam_lines) < 4:
             self.report({'ERROR'}, "Add at least four guide lines.")
             return {'CANCELLED'}
+        cam.data.lens = scene.reblam_lines_focal_length
+        focal_prior_unit = focal_unit_from_mm(scene.reblam_lines_focal_length, cam, scene)
 
         lines = collect_projected_lines(scene)
         threshold = scene.reblam_lines_inlier_threshold
@@ -1105,10 +1119,14 @@ class REBLAMLINES_OT_analyze_solve(bpy.types.Operator):
         vp1, vp2 = focal_vp_pair(scene, families, vps_by_axis)
 
         used_current_lens = False
+        used_focal_prior = False
         if f_unit is None and not has_far_vanishing_point((vp1, vp2), principal):
             f_unit = compute_focal_from_vps(vp1, vp2, principal)
+            if f_unit is not None:
+                f_unit = f_unit * 0.75 + focal_prior_unit * 0.25
+                used_focal_prior = True
         if f_unit is None or f_unit > 100.0:
-            f_unit = sensor_focal_unit(cam, scene)
+            f_unit = focal_prior_unit
             used_current_lens = True
 
         rotation = camera_world_rotation_from_axis_vps(vps_by_axis, principal, f_unit)
@@ -1119,6 +1137,7 @@ class REBLAMLINES_OT_analyze_solve(bpy.types.Operator):
         cam.matrix_world = rotation
         cam.data.sensor_fit = 'HORIZONTAL'
         cam.data.lens = focal_mm_from_unit(f_unit, cam, scene)
+        scene.reblam_lines_focal_length = cam.data.lens
         if used_three_vp_calibration:
             cam.data.shift_x, cam.data.shift_y = camera_shift_from_principal(principal, scene)
         else:
@@ -1132,7 +1151,9 @@ class REBLAMLINES_OT_analyze_solve(bpy.types.Operator):
         if used_three_vp_calibration:
             msg += " (3-VP principal solve)"
         if used_current_lens:
-            msg += " (kept current focal length)"
+            msg += " (used focal setting)"
+        elif used_focal_prior:
+            msg += " (soft focal prior)"
         if far_vp_present:
             msg += " (far VP: skipped optical-center solve)"
         self.report({'INFO'}, msg)
@@ -1216,6 +1237,20 @@ class REBLAMLINES_OT_clear_lines(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class REBLAMLINES_OT_toggle_grid(bpy.types.Operator):
+    bl_idname = "reblam_lines.toggle_grid"
+    bl_label = "Toggle Grid"
+    bl_description = "Show or hide the reBlam preview plane grid."
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        scene.reblam_lines_show_plane_grid = not scene.reblam_lines_show_plane_grid
+        state = "shown" if scene.reblam_lines_show_plane_grid else "hidden"
+        self.report({'INFO'}, f"Plane grid {state}.")
+        return {'FINISHED'}
+
+
 class REBLAMLINES_UL_guides(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         axis_label = item.axis if item.axis != 'AUTO' else "Auto"
@@ -1281,18 +1316,25 @@ class REBLAMLINES_PT_panel(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("reblam_lines.finalize_texture")
         row.operator("reblam_lines.clear_lines", icon='TRASH')
+        layout.operator("reblam_lines.toggle_grid")
 
         box = layout.box()
         box.prop(scene, "reblam_lines_axis_preset", text="Plane")
+        axis_a, axis_b = axis_names_from_preset(scene)
         box.prop(scene, "reblam_lines_plane_offset", text="Plane Height")
+        box.prop(scene, "reblam_lines_grid_rotation", text="Grid Rotation")
         box.prop(scene, "reblam_lines_plane_extent", text="Plane Extent")
-        box.prop(scene, "reblam_lines_plane_subdivisions", text="Plane Detail")
+        row = box.row(align=True)
+        row.prop(scene, "reblam_lines_plane_extent_a", text=f"{axis_a} Extent")
+        row.prop(scene, "reblam_lines_plane_extent_b", text=f"{axis_b} Extent")
+        box.prop(scene, "reblam_lines_plane_subdivisions", text="Grid Detail")
         box.prop(scene, "reblam_lines_live_subdivision_levels", text="Live Subdivision")
         box.prop(scene, "reblam_lines_inlier_threshold", text="Line Tolerance")
         box.prop(scene, "reblam_lines_max_families", text="Max Families")
         box.prop(scene, "reblam_lines_use_principal_solve", text="3-Axis Optical Center")
         box.prop(scene, "reblam_lines_origin_x", text="Origin X")
         box.prop(scene, "reblam_lines_origin_y", text="Origin Y")
+        box.prop(scene, "reblam_lines_focal_length", text="Focal Length")
         box.prop(scene, "reblam_lines_camera_distance", text="Camera Distance")
         box.prop(scene, "reblam_lines_show_guides", text="Show Guides")
         box.prop(scene, "reblam_lines_show_plane_grid", text="Show Plane Grid")
@@ -1326,6 +1368,7 @@ classes = (
     REBLAMLINES_OT_create_projected_plane,
     REBLAMLINES_OT_finalize_texture,
     REBLAMLINES_OT_clear_lines,
+    REBLAMLINES_OT_toggle_grid,
     REBLAMLINES_UL_guides,
     REBLAMLINES_GGT_plane_height,
     REBLAMLINES_PT_panel,
@@ -1348,8 +1391,8 @@ def register():
         default='XY'
     )
     bpy.types.Scene.reblam_lines_plane_subdivisions = bpy.props.IntProperty(
-        name="Plane Detail",
-        description="Subdivisions for the projected floor or wall mesh",
+        name="Grid Detail",
+        description="Preview grid line density. Mesh density comes from Live Subdivision.",
         default=48,
         min=1,
         max=240
@@ -1362,18 +1405,42 @@ def register():
         max=3.0,
         precision=2
     )
+    bpy.types.Scene.reblam_lines_plane_extent_a = bpy.props.FloatProperty(
+        name="Axis A Extent",
+        description="Scale the generated plane along the first selected plane axis",
+        default=1.0,
+        min=0.1,
+        max=5.0,
+        precision=2
+    )
+    bpy.types.Scene.reblam_lines_plane_extent_b = bpy.props.FloatProperty(
+        name="Axis B Extent",
+        description="Scale the generated plane along the second selected plane axis",
+        default=1.0,
+        min=0.1,
+        max=5.0,
+        precision=2
+    )
     bpy.types.Scene.reblam_lines_live_subdivision_levels = bpy.props.IntProperty(
         name="Live Subdivision",
         description="Simple subdivision levels added before live camera projection, so extruded faces receive denser projected texture",
         default=2,
         min=0,
-        max=5
+        max=5,
+        update=update_live_subdivision_levels
     )
     bpy.types.Scene.reblam_lines_plane_offset = bpy.props.FloatProperty(
         name="Plane Height",
         description="Offset of the preview floor or wall along its normal axis",
         default=0.0,
         precision=3
+    )
+    bpy.types.Scene.reblam_lines_grid_rotation = bpy.props.FloatProperty(
+        name="Grid Rotation",
+        description="Rotate the preview grid and generated plane around the selected plane normal",
+        default=0.0,
+        subtype='ANGLE',
+        unit='ROTATION'
     )
     bpy.types.Scene.reblam_lines_inlier_threshold = bpy.props.FloatProperty(
         name="Line Tolerance",
@@ -1408,6 +1475,16 @@ def register():
         default=0.5,
         min=0.0,
         max=1.0
+    )
+    bpy.types.Scene.reblam_lines_focal_length = bpy.props.FloatProperty(
+        name="Focal Length",
+        description="Soft focal length prior for solving, and live camera lens control after solving",
+        default=28.0,
+        min=1.0,
+        max=300.0,
+        subtype='DISTANCE',
+        unit='CAMERA',
+        update=update_reblam_focal_length
     )
     bpy.types.Scene.reblam_lines_camera_distance = bpy.props.FloatProperty(
         name="Camera Distance",
@@ -1459,13 +1536,17 @@ def unregister():
     del bpy.types.Scene.reblam_lines_show_plane_grid
     del bpy.types.Scene.reblam_lines_show_guides
     del bpy.types.Scene.reblam_lines_camera_distance
+    del bpy.types.Scene.reblam_lines_focal_length
     del bpy.types.Scene.reblam_lines_origin_y
     del bpy.types.Scene.reblam_lines_origin_x
     del bpy.types.Scene.reblam_lines_use_principal_solve
     del bpy.types.Scene.reblam_lines_max_families
     del bpy.types.Scene.reblam_lines_inlier_threshold
+    del bpy.types.Scene.reblam_lines_grid_rotation
     del bpy.types.Scene.reblam_lines_plane_offset
     del bpy.types.Scene.reblam_lines_live_subdivision_levels
+    del bpy.types.Scene.reblam_lines_plane_extent_b
+    del bpy.types.Scene.reblam_lines_plane_extent_a
     del bpy.types.Scene.reblam_lines_plane_extent
     del bpy.types.Scene.reblam_lines_plane_subdivisions
     del bpy.types.Scene.reblam_lines_axis_preset
